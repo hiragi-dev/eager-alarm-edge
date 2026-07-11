@@ -5,13 +5,14 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use clap::Parser;
 use eager_alarm_edge::AlarmManager;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_rustls::rustls::ClientConfig;
-use tracing::{error, trace};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const COMMAND_TOPIC: &str = "eager-alarm/pi/command";
 const ALARMS_TOPIC: &str = "eager-alarm/pi/alarms";
+const STATUS_TOPIC: &str = "eager-alarm/pi/status";
 
 /// MQTT connection settings. Each field can be set via a CLI flag, an
 /// environment variable of the same name, or a `.env` file (loaded on
@@ -41,7 +42,8 @@ struct MqttConfig {
 }
 
 /// Payload expected on [`COMMAND_TOPIC`]: `{"type":"add","wakeup_time":"..."}`,
-/// `{"type":"delete","id":"..."}`, or `{"type":"list"}`.
+/// `{"type":"delete","id":"..."}`, `{"type":"list"}`,
+/// `{"type":"pause","duration_ms":5000}`, `{"type":"stop"}`, or `{"type":"status"}`.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AlarmRequest {
@@ -53,6 +55,16 @@ enum AlarmRequest {
         id: Uuid,
     },
     List,
+    Pause {
+        duration_ms: u64,
+    },
+    Stop,
+    Status,
+}
+
+#[derive(Serialize)]
+struct StatusReply {
+    online: bool,
 }
 
 /// Accepts RFC3339 (`2026-07-10T13:31:30+09:00`) as well as a bare
@@ -87,11 +99,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
     let config = MqttConfig::parse();
 
-    let mut mqttoptions = MqttOptions::new(
-        &config.mqtt_client_id,
-        &config.mqtt_host,
-        config.mqtt_port,
-    );
+    let mut mqttoptions =
+        MqttOptions::new(&config.mqtt_client_id, &config.mqtt_host, config.mqtt_port);
     mqttoptions.set_keep_alive(std::time::Duration::from_secs(5));
     mqttoptions.set_credentials(&config.mqtt_username, &config.mqtt_password);
 
@@ -123,15 +132,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let event = eventloop.poll().await;
         match &event {
             Ok(Event::Incoming(Packet::Publish(p))) => {
-                // println!("{:?}", p.payload);
                 match serde_json::from_slice::<AlarmRequest>(&p.payload) {
                     Ok(AlarmRequest::Add { wakeup_time }) => {
                         let id = alarm_handle.add_alarm(wakeup_time);
-                        trace!(%id, %wakeup_time, "added alarm");
+                        info!(%id, %wakeup_time, "added alarm");
                     }
                     Ok(AlarmRequest::Delete { id }) => {
                         alarm_handle.delete_alarm(id);
-                        trace!(%id, "deleted alarm");
+                        info!(%id, "deleted alarm");
                     }
                     Ok(AlarmRequest::List) => {
                         let alarms = alarm_handle.list_alarms().await;
@@ -139,8 +147,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         client
                             .publish(ALARMS_TOPIC, QoS::AtLeastOnce, false, payload)
                             .await?;
+
+                        info!(count = alarms.len(), "listed alarms");
                     }
-                    Err(e) => trace!(error = %e, "invalid command payload"),
+                    Ok(AlarmRequest::Pause { duration_ms }) => {
+                        alarm_handle.pause(std::time::Duration::from_millis(duration_ms));
+                        info!(duration_ms, "paused alarm output");
+                    }
+                    Ok(AlarmRequest::Stop) => {
+                        alarm_handle.stop_all();
+                        info!("stopped all ringing alarms");
+                    }
+                    Ok(AlarmRequest::Status) => {
+                        let payload = serde_json::to_vec(&StatusReply { online: true })?;
+                        client
+                            .publish(STATUS_TOPIC, QoS::AtLeastOnce, false, payload)
+                            .await?;
+
+                        info!("replied to status check");
+                    }
+                    Err(e) => warn!(error = %e, "invalid command payload"),
                 }
             }
             Ok(_) => {}

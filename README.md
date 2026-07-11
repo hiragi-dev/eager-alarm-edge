@@ -54,7 +54,8 @@ mosquitto_pub -t eager-alarm/pi/command -m '{"type":"add","wakeup_time":"2026-07
 {"type": "delete", "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6"}
 ```
 
-`id` is the alarm's UUID, as returned by `list`.
+`id` is the alarm's UUID, as returned by `list`. If the alarm is currently ringing, this also stops it —
+otherwise it rings indefinitely, one output every second, until deleted.
 
 ```
 mosquitto_pub -t eager-alarm/pi/command -m '{"type":"delete","id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}'
@@ -82,4 +83,51 @@ mosquitto_sub -t eager-alarm/pi/alarms
   { "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "wakeup_time": "2026-07-10T13:31:30+09:00" },
   { "id": "9c858901-8a57-4791-81fe-4c455b099bc9", "wakeup_time": "2026-07-10T20:00:00+09:00" }
 ]
+```
+
+### Pause ringing
+
+```
+{"type": "pause", "duration_ms": 5000}
+```
+
+Suppresses ringing for `duration_ms` milliseconds from the moment the message is received. A later `pause`
+overwrites the previous one rather than stacking, so a sender can keep the device muted by re-sending this
+periodically (e.g. every 2s while some ongoing condition holds) and it will resume automatically once
+`duration_ms` has passed since the last message. Alarms are not consumed while muted — a wakeup that occurs
+during the mute window rings as soon as the mute ends.
+
+```
+mosquitto_pub -t eager-alarm/pi/command -m '{"type":"pause","duration_ms":5000}'
+```
+
+### Stop all ringing alarms
+
+```
+{"type": "stop"}
+```
+
+Immediately silences every alarm that is currently ringing, without needing to know their ids — like
+pressing the "off" button on the device. Alarms that haven't fired yet are left scheduled and unaffected.
+
+```
+mosquitto_pub -t eager-alarm/pi/command -m '{"type":"stop"}'
+```
+
+### Status (liveness check)
+
+```
+{"type": "status"}
+```
+
+The device replies immediately on `eager-alarm/pi/status` so a sender can tell online from offline purely
+by whether a reply arrives:
+
+```json
+{ "online": true }
+```
+
+```
+mosquitto_pub -t eager-alarm/pi/command -m '{"type":"status"}'
+mosquitto_sub -t eager-alarm/pi/status
 ```
