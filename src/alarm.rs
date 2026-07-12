@@ -2,7 +2,7 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -25,6 +25,10 @@ pub struct Alarm {
     pub days_of_week: Vec<Weekday>,
     #[serde(default = "default_true")]
     pub is_enabled: bool,
+    /// アプリ側（ブラウザ）が管理する停止方法のID。edge側はこの値の意味を
+    /// 解釈せず、不透明な文字列としてそのまま保存・返却する。
+    #[serde(default)]
+    pub stop_method_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -100,19 +104,38 @@ impl PartialOrd for ScheduledAlarm {
     }
 }
 
+/// `pause` コマンドによるミュート状態を `Ringer` 側から確認するための共有ハンドル。
+/// ミュート期間の記録・更新は `AlarmManager` が行うが、実際にその期間中
+/// 出力（ブザー/スピーカー等）を鳴らさないようにする判断は `Ringer` 実装側の責務。
+#[derive(Clone, Default)]
+pub struct MuteStatus(Arc<Mutex<Option<Instant>>>);
+
+impl MuteStatus {
+    /// 現在ミュート期間中かどうかを返す。
+    pub fn is_muted(&self) -> bool {
+        matches!(*self.0.lock().unwrap(), Some(until) if Instant::now() < until)
+    }
+
+    fn set_muted_until(&self, until: Instant) {
+        *self.0.lock().unwrap() = Some(until);
+    }
+}
+
 /// Produces the alarm's real-world output (buzzer, speaker, LED, ...).
 #[async_trait]
 pub trait Ringer: Send + Sync + 'static {
-    async fn ring(&self, alarm: &Alarm);
+    async fn ring(&self, alarm: &Alarm, mute: &MuteStatus);
 }
 
 pub struct LogRinger;
 
 #[async_trait]
 impl Ringer for LogRinger {
-    async fn ring(&self, alarm: &Alarm) {
+    async fn ring(&self, alarm: &Alarm, mute: &MuteStatus) {
         loop {
-            tracing::info!(id = %alarm.id, time = %alarm.time, "alarm ringing");
+            if !mute.is_muted() {
+                tracing::info!(id = %alarm.id, time = %alarm.time, "alarm ringing");
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -142,43 +165,70 @@ pub struct AlarmManager {
     alarms: HashMap<Uuid, Alarm>,
     queue: BinaryHeap<Reverse<ScheduledAlarm>>,
     ringing: HashMap<Uuid, JoinHandle<()>>,
-    muted_until: Option<Instant>,
+    mute_status: MuteStatus,
     ringer: Arc<dyn Ringer>,
     store_path: Option<PathBuf>,
     cmd_tx: mpsc::UnboundedSender<AlarmCommand>,
     cmd_rx: mpsc::UnboundedReceiver<AlarmCommand>,
 }
 
-/// 保存されているアラーム設定を読み込む。ファイルが存在しない場合は空で開始し、
+/// ファイルへ読み書きする永続化状態。アラーム設定に加えて、プロセス終了時点で
+/// 鳴動中だったアラームの ID も保存し、次回起動時に鳴動を再開できるようにする。
+#[derive(Debug, Default, Deserialize)]
+struct PersistedState {
+    alarms: Vec<Alarm>,
+    #[serde(default)]
+    ringing_ids: Vec<Uuid>,
+}
+
+/// [`PersistedState`] の書き込み専用版。アラームの clone を避けるため参照で持つ。
+#[derive(Serialize)]
+struct PersistedStateRef<'a> {
+    alarms: Vec<&'a Alarm>,
+    ringing_ids: &'a [Uuid],
+}
+
+/// 保存されている状態を読み込む。ファイルが存在しない場合は空で開始し、
 /// 壊れている場合はログに残した上で空で開始する（永続化の失敗でアラーム自体が
-/// 起動できなくなるのを避けるため）。
-fn load_alarms(path: &Path) -> HashMap<Uuid, Alarm> {
-    match std::fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice::<Vec<Alarm>>(&bytes) {
-            Ok(alarms) => alarms.into_iter().map(|a| (a.id, a)).collect(),
-            Err(e) => {
-                tracing::error!(error = %e, path = %path.display(), "failed to parse alarms file; starting with no alarms");
-                HashMap::new()
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+/// 起動できなくなるのを避けるため）。旧形式（アラームの配列のみ）のファイルも
+/// 引き続き読み込める（鳴動中アラームは無しとして扱う）。
+fn load_state(path: &Path) -> PersistedState {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PersistedState::default(),
         Err(e) => {
             tracing::error!(error = %e, path = %path.display(), "failed to read alarms file; starting with no alarms");
-            HashMap::new()
+            return PersistedState::default();
+        }
+    };
+
+    if let Ok(state) = serde_json::from_slice::<PersistedState>(&bytes) {
+        return state;
+    }
+
+    // 旧形式（`Vec<Alarm>` そのもの）へのフォールバック。
+    match serde_json::from_slice::<Vec<Alarm>>(&bytes) {
+        Ok(alarms) => PersistedState {
+            alarms,
+            ringing_ids: Vec::new(),
+        },
+        Err(e) => {
+            tracing::error!(error = %e, path = %path.display(), "failed to parse alarms file; starting with no alarms");
+            PersistedState::default()
         }
     }
 }
 
-/// アラーム設定をファイルへ書き込む。同じディレクトリの一時ファイルに書いてから
+/// 状態をファイルへ書き込む。同じディレクトリの一時ファイルに書いてから
 /// rename することで、書き込み途中の電源断等でファイルが壊れないようにする。
-fn save_alarms(path: &Path, alarms: &[&Alarm]) -> std::io::Result<()> {
+fn save_state(path: &Path, state: &PersistedStateRef) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
 
-    let json = serde_json::to_vec_pretty(alarms)?;
+    let json = serde_json::to_vec_pretty(state)?;
 
     let mut tmp_path = path.as_os_str().to_os_string();
     tmp_path.push(".tmp");
@@ -271,7 +321,7 @@ impl AlarmManager {
             alarms: HashMap::new(),
             queue: BinaryHeap::new(),
             ringing: HashMap::new(),
-            muted_until: None,
+            mute_status: MuteStatus::default(),
             ringer,
             store_path: None,
             cmd_tx,
@@ -288,29 +338,43 @@ impl AlarmManager {
     /// [`with_store`](Self::with_store) の `Ringer` を差し替え可能な版。
     pub fn with_ringer_and_store(ringer: Arc<dyn Ringer>, path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let alarms = load_alarms(&path);
+        let state = load_state(&path);
+        let alarms: HashMap<Uuid, Alarm> = state.alarms.into_iter().map(|a| (a.id, a)).collect();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let mut manager = AlarmManager {
             alarms,
             queue: BinaryHeap::new(),
             ringing: HashMap::new(),
-            muted_until: None,
+            mute_status: MuteStatus::default(),
             ringer,
             store_path: Some(path),
             cmd_tx,
             cmd_rx,
         };
         manager.rebuild_queue();
+
+        // プロセス終了時点で鳴動中だったアラームは、次回起動時に即座に鳴動を再開する。
+        for id in state.ringing_ids {
+            if manager.alarms.contains_key(&id) {
+                manager.start_ringing(id);
+            }
+        }
+
         manager
     }
 
-    /// `store_path` が設定されていれば現在のアラーム設定をファイルへ書き込む。
+    /// `store_path` が設定されていれば現在のアラーム設定と鳴動状態をファイルへ書き込む。
     fn persist(&self) {
         let Some(path) = &self.store_path else {
             return;
         };
         let alarms: Vec<&Alarm> = self.alarms.values().collect();
-        if let Err(e) = save_alarms(path, &alarms) {
+        let ringing_ids: Vec<Uuid> = self.ringing.keys().copied().collect();
+        let state = PersistedStateRef {
+            alarms,
+            ringing_ids: &ringing_ids,
+        };
+        if let Err(e) = save_state(path, &state) {
             tracing::error!(error = %e, path = %path.display(), "failed to persist alarms");
         }
     }
@@ -339,19 +403,12 @@ impl AlarmManager {
         Instant::now() + dur
     }
 
-    fn effective_deadline(&self, wakeup_time: DateTime<Local>) -> Instant {
-        let deadline = Self::deadline_for(wakeup_time);
-        match self.muted_until {
-            Some(mute) if mute > deadline => mute,
-            _ => deadline,
-        }
-    }
-
     fn start_ringing(&mut self, alarm_id: Uuid) {
         if let Some(alarm) = self.alarms.get(&alarm_id) {
             let ringer = Arc::clone(&self.ringer);
             let ringing_alarm = alarm.clone();
-            let join = tokio::spawn(async move { ringer.ring(&ringing_alarm).await });
+            let mute_status = self.mute_status.clone();
+            let join = tokio::spawn(async move { ringer.ring(&ringing_alarm, &mute_status).await });
             self.ringing.insert(alarm_id, join);
         }
     }
@@ -405,7 +462,9 @@ impl AlarmManager {
                 });
             }
             AlarmCommand::Pause(duration) => {
-                self.muted_until = Some(Instant::now() + duration);
+                // ミュート期間を記録するだけ。実際に出力を止めるかどうかは、
+                // 鳴動中/これから鳴動する各 Ringer が MuteStatus を見て判断する。
+                self.mute_status.set_muted_until(Instant::now() + duration);
             }
             AlarmCommand::StopAll => {
                 // 先に鳴動中のIDを記録してから停止する（stop_ringing が ringing から除去するため）
@@ -432,6 +491,8 @@ impl AlarmManager {
                     };
                     self.schedule_alarm(id, base);
                 }
+
+                self.persist();
             }
         }
     }
@@ -458,15 +519,10 @@ impl AlarmManager {
                 continue;
             };
 
-            let deadline = self.effective_deadline(next_scheduled.next_wakeup);
+            let deadline = Self::deadline_for(next_scheduled.next_wakeup);
 
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
-                    // mute がまだ有効なら、ループ先頭に戻って effective_deadline を再計算する
-                    if matches!(self.muted_until, Some(mute) if mute > Instant::now()) {
-                        continue;
-                    }
-
                     if let Some(Reverse(scheduled)) = self.queue.pop() {
                         self.start_ringing(scheduled.alarm_id);
 
@@ -475,6 +531,10 @@ impl AlarmManager {
                         // 同じ日の時刻が再度選ばれることはなく、次の曜日へ進む。
                         let next_base = scheduled.next_wakeup + chrono::Duration::seconds(2);
                         self.schedule_alarm(scheduled.alarm_id, next_base);
+
+                        // 鳴動開始をファイルへ反映する。ここで永続化しておかないと、
+                        // 鳴動中にプロセスが落ちた場合に次回起動時に鳴動を再開できない。
+                        self.persist();
                     }
                 }
                 cmd = self.cmd_rx.recv() => {

@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local};
-use eager_alarm_edge::{Alarm, AlarmManager, LogRinger, Ringer};
+use eager_alarm_edge::{Alarm, AlarmManager, LogRinger, MuteStatus, Ringer};
 use uuid::Uuid;
 
 struct CountingRinger {
@@ -18,9 +18,11 @@ struct CountingRinger {
 
 #[async_trait]
 impl Ringer for CountingRinger {
-    async fn ring(&self, _alarm: &Alarm) {
+    async fn ring(&self, _alarm: &Alarm, mute: &MuteStatus) {
         loop {
-            self.count.fetch_add(1, Ordering::SeqCst);
+            if !mute.is_muted() {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
             tokio::time::sleep(self.interval).await;
         }
     }
@@ -32,7 +34,7 @@ struct RecordingRinger {
 
 #[async_trait]
 impl Ringer for RecordingRinger {
-    async fn ring(&self, alarm: &Alarm) {
+    async fn ring(&self, alarm: &Alarm, _mute: &MuteStatus) {
         self.fired.lock().unwrap().push(alarm.id);
     }
 }
@@ -43,6 +45,7 @@ fn create_alarm(time: DateTime<Local>) -> Alarm {
         time: time.time(),
         days_of_week: vec![time.weekday()],
         is_enabled: true,
+        stop_method_id: None,
     }
 }
 

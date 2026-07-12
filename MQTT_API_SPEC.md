@@ -17,7 +17,8 @@ An alarm is represented by the following JSON structure:
   "id": "123e4567-e89b-12d3-a456-426614174000",
   "time": "08:00",
   "days_of_week": ["Mon", "Tue", "Wed", "Thu", "Fri"],
-  "is_enabled": true
+  "is_enabled": true,
+  "stop_method_id": "geo:office"
 }
 ```
 
@@ -25,6 +26,7 @@ An alarm is represented by the following JSON structure:
 - `time` (String): Time in `HH:MM` format (24-hour clock).
 - `days_of_week` (Array of Strings): Days when the alarm should ring. Valid values: `"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"`. Empty array means the alarm will never ring automatically.
 - `is_enabled` (Boolean): Master toggle for the alarm. If false, the alarm is skipped even if the day and time match.
+- `stop_method_id` (String or `null`): Opaque identifier of a location-based stop method managed by the app (frontend). The edge does not interpret or validate this value in any way — it is stored as given and returned unchanged. `null` if none is set, including for alarms created before this field existed.
 
 ---
 
@@ -40,9 +42,12 @@ Creates a new alarm. The backend will generate and assign a new UUID.
   "type": "add",
   "time": "07:30",
   "days_of_week": ["Sat", "Sun"],
-  "is_enabled": true
+  "is_enabled": true,
+  "stop_method_id": "geo:office"
 }
 ```
+
+`stop_method_id` is optional; if omitted, it is stored as `null`.
 
 ### 2. Edit Alarm
 Modifies an existing alarm.
@@ -53,9 +58,12 @@ Modifies an existing alarm.
   "id": "123e4567-e89b-12d3-a456-426614174000",
   "time": "08:15",
   "days_of_week": ["Mon", "Wed", "Fri"],
-  "is_enabled": false
+  "is_enabled": false,
+  "stop_method_id": "geo:office"
 }
 ```
+
+`stop_method_id` is optional; if omitted, the alarm's value is overwritten with `null` (edit replaces the full alarm, it does not merge fields).
 
 ### 3. Delete Alarm
 Deletes an alarm by its ID.
@@ -128,7 +136,8 @@ Triggered by the `list` command (and usually automatically broadcasted when an a
     "id": "123e4567-e89b-12d3-a456-426614174000",
     "time": "08:00",
     "days_of_week": ["Mon", "Tue", "Wed", "Thu", "Fri"],
-    "is_enabled": true
+    "is_enabled": true,
+    "stop_method_id": "geo:office"
   }
 ]
 ```

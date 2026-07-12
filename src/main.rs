@@ -68,6 +68,8 @@ enum AlarmRequest {
         days_of_week: Vec<Weekday>,
         #[serde(default = "default_true")]
         is_enabled: bool,
+        #[serde(default)]
+        stop_method_id: Option<String>,
     },
     Edit {
         id: Uuid,
@@ -77,6 +79,8 @@ enum AlarmRequest {
         days_of_week: Vec<Weekday>,
         #[serde(default = "default_true")]
         is_enabled: bool,
+        #[serde(default)]
+        stop_method_id: Option<String>,
     },
     Delete {
         id: Uuid,
@@ -150,12 +154,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         time,
                         days_of_week,
                         is_enabled,
+                        stop_method_id,
                     }) => {
                         let new_alarm = Alarm {
                             id: Uuid::new_v4(),
                             time,
                             days_of_week,
                             is_enabled,
+                            stop_method_id,
                         };
                         let id = alarm_handle.add_alarm(new_alarm.clone());
                         info!(%id, %time, "added alarm");
@@ -165,12 +171,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         time,
                         days_of_week,
                         is_enabled,
+                        stop_method_id,
                     }) => {
                         let edit_alarm = Alarm {
                             id,
                             time,
                             days_of_week,
                             is_enabled,
+                            stop_method_id,
                         };
                         alarm_handle.edit_alarm(edit_alarm.clone());
                         info!(%id, %time, "edited alarm");
