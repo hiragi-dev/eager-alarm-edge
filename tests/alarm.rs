@@ -1,18 +1,16 @@
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use chrono::Local;
+use chrono::{DateTime, Datelike, Local};
 use eager_alarm_edge::{Alarm, AlarmManager, LogRinger, Ringer};
 use uuid::Uuid;
 
-/// Rings repeatedly at `interval` until aborted. Demonstrates a Ringer
-/// that owns a continuous loop.
 struct CountingRinger {
     count: Arc<AtomicUsize>,
     interval: Duration,
@@ -28,9 +26,6 @@ impl Ringer for CountingRinger {
     }
 }
 
-/// Records the id of every alarm it's asked to ring, then returns
-/// immediately. Demonstrates a Ringer that deliberately does NOT loop —
-/// AlarmManager has no opinion on pacing, so this is equally valid.
 struct RecordingRinger {
     fired: Arc<Mutex<Vec<Uuid>>>,
 }
@@ -42,19 +37,13 @@ impl Ringer for RecordingRinger {
     }
 }
 
-#[test]
-fn alarm_ordering_is_by_wakeup_time() {
-    let now = Local::now();
-    let earlier = Alarm {
+fn create_alarm(time: DateTime<Local>) -> Alarm {
+    Alarm {
         id: Uuid::new_v4(),
-        wakeup_time: now,
-    };
-    let later = Alarm {
-        id: Uuid::new_v4(),
-        wakeup_time: now + chrono::Duration::seconds(1),
-    };
-
-    assert!(earlier < later);
+        time: time.time(),
+        days_of_week: vec![time.weekday()],
+        is_enabled: true,
+    }
 }
 
 #[tokio::test]
@@ -63,7 +52,8 @@ async fn add_and_list_a_pending_alarm() {
     let handle = manager.handle();
     let task = tokio::spawn(async move { manager.run().await });
 
-    let id = handle.add_alarm(Local::now() + chrono::Duration::seconds(30));
+    let alarm = create_alarm(Local::now() + chrono::Duration::seconds(30));
+    let id = handle.add_alarm(alarm);
     let listed = handle.list_alarms().await;
 
     assert_eq!(listed.len(), 1);
@@ -82,7 +72,8 @@ async fn delete_removes_a_pending_alarm_before_it_fires() {
     let handle = manager.handle();
     let task = tokio::spawn(async move { manager.run().await });
 
-    let id = handle.add_alarm(Local::now() + chrono::Duration::milliseconds(200));
+    let alarm = create_alarm(Local::now() + chrono::Duration::milliseconds(200));
+    let id = handle.add_alarm(alarm);
     handle.delete_alarm(id);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -102,10 +93,14 @@ async fn alarms_fire_in_wakeup_time_order_regardless_of_insertion_order() {
     let handle = manager.handle();
     let task = tokio::spawn(async move { manager.run().await });
 
-    // Inserted out of chronological order on purpose.
-    let id_300 = handle.add_alarm(Local::now() + chrono::Duration::milliseconds(300));
-    let id_100 = handle.add_alarm(Local::now() + chrono::Duration::milliseconds(100));
-    let id_200 = handle.add_alarm(Local::now() + chrono::Duration::milliseconds(200));
+    let alarm_300 = create_alarm(Local::now() + chrono::Duration::milliseconds(300));
+    let id_300 = handle.add_alarm(alarm_300);
+
+    let alarm_100 = create_alarm(Local::now() + chrono::Duration::milliseconds(100));
+    let id_100 = handle.add_alarm(alarm_100);
+
+    let alarm_200 = create_alarm(Local::now() + chrono::Duration::milliseconds(200));
+    let id_200 = handle.add_alarm(alarm_200);
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -127,10 +122,9 @@ async fn ringing_alarm_keeps_ringing_until_deleted() {
     let handle = manager.handle();
     let task = tokio::spawn(async move { manager.run().await });
 
-    let id = handle.add_alarm(Local::now());
+    let alarm = create_alarm(Local::now());
+    let id = handle.add_alarm(alarm);
 
-    // Several ticks should have happened, proving the ringer keeps going
-    // rather than firing once and stopping.
     tokio::time::sleep(Duration::from_millis(220)).await;
     let ticks_before_delete = count.load(Ordering::SeqCst);
     assert!(
@@ -143,8 +137,6 @@ async fn ringing_alarm_keeps_ringing_until_deleted() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(handle.list_alarms().await.is_empty());
 
-    // Deleting must actually abort the background task, not just unlist
-    // the alarm.
     let ticks_at_delete = count.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
@@ -166,18 +158,27 @@ async fn stop_all_silences_ringing_alarms_but_leaves_pending_ones_scheduled() {
     let handle = manager.handle();
     let task = tokio::spawn(async move { manager.run().await });
 
-    let ringing_id = handle.add_alarm(Local::now());
-    let pending_id = handle.add_alarm(Local::now() + chrono::Duration::seconds(30));
+    let ringing_alarm = create_alarm(Local::now());
+    let ringing_id = handle.add_alarm(ringing_alarm);
+
+    let pending_alarm = create_alarm(Local::now() + chrono::Duration::seconds(30));
+    let pending_id = handle.add_alarm(pending_alarm);
 
     tokio::time::sleep(Duration::from_millis(120)).await;
-    assert!(count.load(Ordering::SeqCst) >= 1, "should be ringing by now");
+    assert!(
+        count.load(Ordering::SeqCst) >= 1,
+        "should be ringing by now"
+    );
 
     handle.stop_all();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let listed = handle.list_alarms().await;
-    assert_eq!(listed.len(), 1, "the pending alarm should remain scheduled");
-    assert_eq!(listed[0].id, pending_id);
+    assert_eq!(
+        listed.len(),
+        2,
+        "stop_all leaves the stopped alarm as well as pending ones in the list"
+    );
 
     let ticks_at_stop = count.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -202,20 +203,15 @@ async fn pause_overwrites_rather_than_accumulates_and_then_auto_resumes() {
     let handle = manager.handle();
     let task = tokio::spawn(async move { manager.run().await });
 
-    let id = handle.add_alarm(Local::now() + chrono::Duration::milliseconds(200));
+    let alarm = create_alarm(Local::now() + chrono::Duration::milliseconds(200));
+    let id = handle.add_alarm(alarm);
 
-    // Repeatedly re-pause every 100ms, simulating an ongoing trigger (e.g.
-    // footsteps). If pauses accumulated instead of overwriting, this alone
-    // would push the alarm out by 6 * 300ms.
     for _ in 0..6 {
         handle.pause(Duration::from_millis(300));
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // ~600ms elapsed; the original 200ms deadline has long passed, so the
-    // alarm must still be muted, not ringing.
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
-    // No more pauses sent: should auto-resume ~300ms after the last one.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         count.load(Ordering::SeqCst) >= 1,

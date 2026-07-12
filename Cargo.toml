@@ -8,6 +8,7 @@ async-trait = "0.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 color-backtrace = "0.7.2"
+dirs = "6"
 dotenvy = "0.15"
 rumqttc = { version = "0.25.1", features = ["url", "websocket"] }
 rustls-native-certs = "0.8.4"

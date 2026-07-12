@@ -1,9 +1,8 @@
-//! Example of how to configure rumqttc to connect to a server using TLS and authentication.
-use std::error::Error;
+use std::{error::Error, path::PathBuf};
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+use chrono::{NaiveTime, Weekday};
 use clap::Parser;
-use eager_alarm_edge::AlarmManager;
+use eager_alarm_edge::{Alarm, AlarmManager, naive_time_hm};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
 use tokio_rustls::rustls::ClientConfig;
@@ -13,48 +12,79 @@ use uuid::Uuid;
 const COMMAND_TOPIC: &str = "eager-alarm/pi/command";
 const ALARMS_TOPIC: &str = "eager-alarm/pi/alarms";
 const STATUS_TOPIC: &str = "eager-alarm/pi/status";
+/// 鳴動状態応答トピック（`ringing_status` コマンドへの応答）
+const RINGING_STATUS_TOPIC: &str = "eager-alarm/pi/ringing_status";
 
-/// MQTT connection settings. Each field can be set via a CLI flag, an
-/// environment variable of the same name, or a `.env` file (loaded on
-/// startup) providing that variable.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct MqttConfig {
-    /// MQTT broker hostname
     #[arg(long, env = "MQTT_HOST")]
     mqtt_host: String,
 
-    /// MQTT broker port
     #[arg(long, env = "MQTT_PORT", default_value_t = 8883)]
     mqtt_port: u16,
 
-    /// Client id this device identifies itself as
     #[arg(long, env = "MQTT_CLIENT_ID", default_value = "pi")]
     mqtt_client_id: String,
 
-    /// MQTT username
     #[arg(long, env = "MQTT_USERNAME")]
     mqtt_username: String,
 
-    /// MQTT password
     #[arg(long, env = "MQTT_PASSWORD")]
     mqtt_password: String,
+
+    /// アラーム設定の保存先。未指定なら `default_alarms_file()` を使う。
+    #[arg(long, env = "ALARMS_FILE")]
+    alarms_file: Option<PathBuf>,
 }
 
-/// Payload expected on [`COMMAND_TOPIC`]: `{"type":"add","wakeup_time":"..."}`,
-/// `{"type":"delete","id":"..."}`, `{"type":"list"}`,
-/// `{"type":"pause","duration_ms":5000}`, `{"type":"stop"}`, or `{"type":"status"}`.
+/// アラーム設定ファイルのデフォルトの保存場所を決める。
+///
+/// systemd の `StateDirectory=` が設定されていれば `$STATE_DIRECTORY`
+/// （ユーザーサービスなら `~/.local/state/eager-alarm-edge` 等、
+/// systemd が作成・権限設定まで行う）を最優先する。
+/// systemd 抜きで動かす場合は XDG の state ディレクトリ
+/// （`dirs::state_dir()`）にフォールバックする。
+fn default_alarms_file() -> PathBuf {
+    if let Ok(state_directory) = std::env::var("STATE_DIRECTORY") {
+        if let Some(dir) = state_directory.split(':').find(|s| !s.is_empty()) {
+            return PathBuf::from(dir).join("alarms.json");
+        }
+    }
+
+    dirs::state_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("eager-alarm-edge")
+        .join("alarms.json")
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AlarmRequest {
     Add {
-        #[serde(deserialize_with = "deserialize_wakeup_time")]
-        wakeup_time: DateTime<Local>,
+        #[serde(with = "naive_time_hm")]
+        time: NaiveTime,
+        #[serde(default)]
+        days_of_week: Vec<Weekday>,
+        #[serde(default = "default_true")]
+        is_enabled: bool,
+    },
+    Edit {
+        id: Uuid,
+        #[serde(with = "naive_time_hm")]
+        time: NaiveTime,
+        #[serde(default)]
+        days_of_week: Vec<Weekday>,
+        #[serde(default = "default_true")]
+        is_enabled: bool,
     },
     Delete {
         id: Uuid,
     },
     List,
+    /// 現在鳴動中のアラームがあるかどうかを問い合わせる。
+    /// 応答は `eager-alarm/<id>/ringing_status` トピックに publish される。
+    RingingStatus,
     Pause {
         duration_ms: u64,
     },
@@ -62,30 +92,13 @@ enum AlarmRequest {
     Status,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize)]
 struct StatusReply {
     online: bool,
-}
-
-/// Accepts RFC3339 (`2026-07-10T13:31:30+09:00`) as well as a bare
-/// `"YYYY-MM-DD HH:MM:SS"` string, which is interpreted as local time.
-fn deserialize_wakeup_time<'de, D>(deserializer: D) -> Result<DateTime<Local>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
-        return Ok(dt.with_timezone(&Local));
-    }
-
-    let naive =
-        NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").map_err(serde::de::Error::custom)?;
-
-    Local
-        .from_local_datetime(&naive)
-        .single()
-        .ok_or_else(|| serde::de::Error::custom("ambiguous or invalid local time"))
 }
 
 #[tokio::main]
@@ -95,7 +108,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
     color_backtrace::install();
 
-    // Missing .env is fine: real deployments may set the environment directly.
     dotenvy::dotenv().ok();
     let config = MqttConfig::parse();
 
@@ -104,7 +116,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     mqttoptions.set_keep_alive(std::time::Duration::from_secs(5));
     mqttoptions.set_credentials(&config.mqtt_username, &config.mqtt_password);
 
-    // Use rustls-native-certs to load root certificates from the operating system.
     let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
     root_cert_store.add_parsable_certificates(
         rustls_native_certs::load_native_certs().expect("could not load platform certs"),
@@ -123,7 +134,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await
         .unwrap();
 
-    let mut alarm = AlarmManager::new();
+    let alarms_file = config.alarms_file.clone().unwrap_or_else(default_alarms_file);
+    info!(path = %alarms_file.display(), "using alarms store");
+    let mut alarm = AlarmManager::with_store(alarms_file);
     let alarm_handle = alarm.handle();
 
     tokio::spawn(async move { alarm.run().await });
@@ -133,9 +146,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
         match &event {
             Ok(Event::Incoming(Packet::Publish(p))) => {
                 match serde_json::from_slice::<AlarmRequest>(&p.payload) {
-                    Ok(AlarmRequest::Add { wakeup_time }) => {
-                        let id = alarm_handle.add_alarm(wakeup_time);
-                        info!(%id, %wakeup_time, "added alarm");
+                    Ok(AlarmRequest::Add {
+                        time,
+                        days_of_week,
+                        is_enabled,
+                    }) => {
+                        let new_alarm = Alarm {
+                            id: Uuid::new_v4(),
+                            time,
+                            days_of_week,
+                            is_enabled,
+                        };
+                        let id = alarm_handle.add_alarm(new_alarm.clone());
+                        info!(%id, %time, "added alarm");
+                    }
+                    Ok(AlarmRequest::Edit {
+                        id,
+                        time,
+                        days_of_week,
+                        is_enabled,
+                    }) => {
+                        let edit_alarm = Alarm {
+                            id,
+                            time,
+                            days_of_week,
+                            is_enabled,
+                        };
+                        alarm_handle.edit_alarm(edit_alarm.clone());
+                        info!(%id, %time, "edited alarm");
                     }
                     Ok(AlarmRequest::Delete { id }) => {
                         alarm_handle.delete_alarm(id);
@@ -149,6 +187,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             .await?;
 
                         info!(count = alarms.len(), "listed alarms");
+                    }
+                    Ok(AlarmRequest::RingingStatus) => {
+                        let status = alarm_handle.get_ringing_status().await;
+                        let payload = serde_json::to_vec(&status)?;
+                        client
+                            .publish(RINGING_STATUS_TOPIC, QoS::AtLeastOnce, false, payload)
+                            .await?;
+
+                        info!(
+                            is_ringing = status.is_ringing,
+                            count = status.ringing_ids.len(),
+                            "replied to ringing_status"
+                        );
                     }
                     Ok(AlarmRequest::Pause { duration_ms }) => {
                         alarm_handle.pause(std::time::Duration::from_millis(duration_ms));
@@ -166,7 +217,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         info!("replied to status check");
                     }
-                    Err(e) => warn!(error = %e, "invalid command payload"),
+                    Err(e) => {
+                        let payload_str = String::from_utf8_lossy(&p.payload);
+                        warn!(error = %e, payload = %payload_str, "invalid command payload");
+                    }
                 }
             }
             Ok(_) => {}
